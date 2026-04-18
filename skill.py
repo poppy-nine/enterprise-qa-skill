@@ -2,6 +2,7 @@
 """
 企业智能问答助手 - 核心查询处理脚本
 支持数据库查询、知识库检索、混合查询，带来源标注
+支持员工管理：添加、修改、删除
 """
 
 import sqlite3
@@ -12,6 +13,7 @@ import argparse
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass
@@ -19,7 +21,7 @@ class QueryResult:
     """查询结果"""
     answer: str
     source: str
-    query_type: str  # 'db', 'kb', 'mixed'
+    query_type: str  # 'db', 'kb', 'mixed', 'write', 'error'
 
 
 class EnterpriseQA:
@@ -115,6 +117,41 @@ class EnterpriseQA:
         except sqlite3.Error as e:
             return []
 
+    def _execute_write_query(self, query: str, params: tuple) -> Tuple[bool, str]:
+        """执行写入操作（INSERT/UPDATE/DELETE）"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            affected = cursor.rowcount
+            conn.close()
+            return True, f"成功，影响 {affected} 条记录"
+        except sqlite3.Error as e:
+            return False, str(e)
+
+    def _get_next_employee_id(self) -> str:
+        """获取下一个员工ID"""
+        results = self._execute_safe_query(
+            "SELECT MAX(employee_id) FROM employees", ()
+        )
+        if results and results[0][0]:
+            last_id = results[0][0]
+            num = int(last_id.replace('EMP-', '')) + 1
+            return f'EMP-{num:03d}'
+        return 'EMP-010'
+
+    def _validate_employee_data(self, name: str, department: str, level: str) -> Tuple[bool, str]:
+        """验证员工数据"""
+        if not name or len(name) > 50:
+            return False, "员工名不能为空且不超过50字符"
+        if department not in self.DEPARTMENTS:
+            return False, f"部门必须是：{', '.join(self.DEPARTMENTS)}"
+        valid_levels = ['P4', 'P5', 'P6', 'P7', 'P8', 'P9', 'P10']
+        if level not in valid_levels:
+            return False, f"职级必须是：{', '.join(valid_levels)}"
+        return True, ""
+
     def _search_knowledge_base(self, keywords: List[str]) -> Tuple[str, str]:
         """搜索知识库"""
         best_match = None
@@ -168,6 +205,27 @@ class EnterpriseQA:
             )
 
         question = question.strip()
+
+        # ========== 员工管理操作（增删改）==========
+
+        # 添加员工：添加员工 姓名 部门 职级
+        add_match = re.match(r'添加员工\s+(\S+)\s+(\S+)\s+(P\d+)', question)
+        if add_match:
+            return self._add_employee(add_match.group(1), add_match.group(2), add_match.group(3))
+
+        # 修改员工：修改员工 姓名/EMP-XXX 的 部门/职级/邮箱 为 新值
+        modify_match = re.match(r'修改员工\s+(\S+)\s+的\s+(部门|职级|邮箱|上级)\s+为\s+(\S+)', question)
+        if modify_match:
+            return self._modify_employee(modify_match.group(1), modify_match.group(2), modify_match.group(3))
+
+        # 删除员工：删除员工 姓名/EMP-XXX
+        delete_match = re.match(r'删除员工\s+(\S+)', question)
+        if delete_match:
+            return self._delete_employee(delete_match.group(1))
+
+        # 列出所有员工
+        if question in ['列出所有员工', '所有员工', '员工列表']:
+            return self._list_all_employees()
 
         # 检测问题中是否有员工名
         employee_names_list = ['张三', '李四', '王五', '赵六', '钱七', '孙八', '周九', '吴十', 'CEO']
@@ -489,6 +547,237 @@ class EnterpriseQA:
             result += '\n\n建议：\n' + '\n'.join(suggestions)
 
         return result
+
+    # ========== 员工管理方法 ==========
+
+    def _add_employee(self, name: str, department: str, level: str) -> QueryResult:
+        """添加员工"""
+        # 验证数据
+        valid, msg = self._validate_employee_data(name, department, level)
+        if not valid:
+            return QueryResult(
+                answer=f"添加失败：{msg}",
+                source="数据验证",
+                query_type="error"
+            )
+
+        # 检查是否已存在同名员工
+        existing = self._execute_safe_query(
+            "SELECT employee_id FROM employees WHERE name = ?", (name,)
+        )
+        if existing:
+            return QueryResult(
+                answer=f"添加失败：已存在同名员工 {name} ({existing[0][0]})",
+                source="employees 表",
+                query_type="error"
+            )
+
+        # 生成新ID
+        new_id = self._get_next_employee_id()
+        today = datetime.now().strftime('%Y-%m-%d')
+        email = f"{name.lower()}@company.com"
+
+        # 执行插入
+        success, msg = self._execute_write_query(
+            """INSERT INTO employees
+               (employee_id, name, department, level, hire_date, manager_id, email, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (new_id, name, department, level, today, 'EMP-000', email, 'active')
+        )
+
+        if success:
+            return QueryResult(
+                answer=f"员工添加成功！\n- ID: {new_id}\n- 姓名: {name}\n- 部门: {department}\n- 职级: {level}\n- 邮箱: {email}",
+                source=f"employees 表 (新记录)",
+                query_type="write"
+            )
+        else:
+            return QueryResult(
+                answer=f"添加失败：{msg}",
+                source="employees 表",
+                query_type="error"
+            )
+
+    def _modify_employee(self, emp_identifier: str, field: str, new_value: str) -> QueryResult:
+        """修改员工信息"""
+        # 获取员工ID
+        if emp_identifier.startswith('EMP-'):
+            emp_id = emp_identifier
+        else:
+            emp_id = self._get_employee_id(emp_identifier)
+            if not emp_id:
+                # 尝试从数据库查找
+                results = self._execute_safe_query(
+                    "SELECT employee_id FROM employees WHERE name = ?", (emp_identifier,)
+                )
+                if results:
+                    emp_id = results[0][0]
+                else:
+                    return QueryResult(
+                        answer=f"未找到员工 \"{emp_identifier}\"",
+                        source="employees 表",
+                        query_type="error"
+                    )
+
+        # 获取当前员工信息
+        emp_info = self._execute_safe_query(
+            "SELECT name, department, level FROM employees WHERE employee_id = ?", (emp_id,)
+        )
+        if not emp_info:
+            return QueryResult(
+                answer=f"未找到员工 {emp_id}",
+                source="employees 表",
+                query_type="error"
+            )
+
+        old_name, old_dept, old_level = emp_info[0]
+
+        # 验证新值
+        field_map = {
+            '部门': 'department',
+            '职级': 'level',
+            '邮箱': 'email',
+            '上级': 'manager_id'
+        }
+        db_field = field_map.get(field, field)
+
+        if field == '部门' and new_value not in self.DEPARTMENTS:
+            return QueryResult(
+                answer=f"修改失败：部门必须是 {', '.join(self.DEPARTMENTS)}",
+                source="数据验证",
+                query_type="error"
+            )
+
+        if field == '职级':
+            valid_levels = ['P4', 'P5', 'P6', 'P7', 'P8', 'P9', 'P10']
+            if new_value not in valid_levels:
+                return QueryResult(
+                    answer=f"修改失败：职级必须是 {', '.join(valid_levels)}",
+                    source="数据验证",
+                    query_type="error"
+                )
+
+        if field == '上级':
+            if not new_value.startswith('EMP-'):
+                # 尝试查找上级ID
+                mgr_results = self._execute_safe_query(
+                    "SELECT employee_id FROM employees WHERE name = ?", (new_value,)
+                )
+                if mgr_results:
+                    new_value = mgr_results[0][0]
+                else:
+                    return QueryResult(
+                        answer=f"修改失败：未找到上级 \"{new_value}\"",
+                        source="employees 表",
+                        query_type="error"
+                    )
+
+        # 执行更新
+        success, msg = self._execute_write_query(
+            f"UPDATE employees SET {db_field} = ? WHERE employee_id = ?",
+            (new_value, emp_id)
+        )
+
+        if success:
+            return QueryResult(
+                answer=f"员工 {old_name}({emp_id}) 的{field}已修改为 {new_value}",
+                source=f"employees 表 (employee_id: {emp_id})",
+                query_type="write"
+            )
+        else:
+            return QueryResult(
+                answer=f"修改失败：{msg}",
+                source="employees 表",
+                query_type="error"
+            )
+
+    def _delete_employee(self, emp_identifier: str) -> QueryResult:
+        """删除员工"""
+        # 获取员工ID
+        if emp_identifier.startswith('EMP-'):
+            emp_id = emp_identifier
+        else:
+            emp_id = self._get_employee_id(emp_identifier)
+            if not emp_id:
+                results = self._execute_safe_query(
+                    "SELECT employee_id FROM employees WHERE name = ?", (emp_identifier,)
+                )
+                if results:
+                    emp_id = results[0][0]
+                else:
+                    return QueryResult(
+                        answer=f"未找到员工 \"{emp_identifier}\"",
+                        source="employees 表",
+                        query_type="error"
+                    )
+
+        # 获取员工信息（用于确认）
+        emp_info = self._execute_safe_query(
+            "SELECT name, department, level FROM employees WHERE employee_id = ?", (emp_id,)
+        )
+        if not emp_info:
+            return QueryResult(
+                answer=f"未找到员工 {emp_id}",
+                source="employees 表",
+                query_type="error"
+            )
+
+        name, dept, level = emp_info[0]
+
+        # 检查是否是CEO或有下属
+        subordinates = self._execute_safe_query(
+            "SELECT COUNT(*) FROM employees WHERE manager_id = ?", (emp_id,)
+        )
+        if subordinates and subordinates[0][0] > 0:
+            return QueryResult(
+                answer=f"删除失败：{name} 还有 {subordinates[0][0]} 名下属，请先调整下属的上级",
+                source="employees 表",
+                query_type="error"
+            )
+
+        # 执行删除
+        success, msg = self._execute_write_query(
+            "DELETE FROM employees WHERE employee_id = ?", (emp_id,)
+        )
+
+        if success:
+            return QueryResult(
+                answer=f"员工删除成功！\n- ID: {emp_id}\n- 姓名: {name}\n- 部门: {dept}\n- 职级: {level}",
+                source=f"employees 表 (已删除)",
+                query_type="write"
+            )
+        else:
+            return QueryResult(
+                answer=f"删除失败：{msg}",
+                source="employees 表",
+                query_type="error"
+            )
+
+    def _list_all_employees(self) -> QueryResult:
+        """列出所有员工"""
+        results = self._execute_safe_query(
+            """SELECT employee_id, name, department, level, status
+               FROM employees ORDER BY employee_id""",
+            ()
+        )
+
+        if not results:
+            return QueryResult(
+                answer="当前无员工记录",
+                source="employees 表",
+                query_type="db"
+            )
+
+        lines = ["| ID | 姓名 | 部门 | 职级 | 状态 |"]
+        lines.append("|------|------|------|------|------|")
+        for emp_id, name, dept, level, status in results:
+            lines.append(f"| {emp_id} | {name} | {dept} | {level} | {status} |")
+
+        return QueryResult(
+            answer=f"员工列表（共 {len(results)} 人）：\n" + '\n'.join(lines),
+            source="employees 表",
+            query_type="db"
+        )
 
 
 def main():
